@@ -39,6 +39,11 @@ OCF_RESKEY_user_default="neutron"
 OCF_RESKEY_pid_default="$HA_RSCTMP/$OCF_RESOURCE_INSTANCE.pid"
 OCF_RESKEY_neutron_server_port_default="9696"
 OCF_RESKEY_amqp_server_port_default="5672"
+OCF_RESKEY_cluster_hostname_default="neutron"
+OCF_RESKEY_delete_netns_default="false"
+
+LOCAL_hostname="$HA_RSCTMP/$OCF_RESOURCE_INSTANCE.hostname"
+
 
 : ${OCF_RESKEY_binary=${OCF_RESKEY_binary_default}}
 : ${OCF_RESKEY_config=${OCF_RESKEY_config_default}}
@@ -47,7 +52,8 @@ OCF_RESKEY_amqp_server_port_default="5672"
 : ${OCF_RESKEY_pid=${OCF_RESKEY_pid_default}}
 : ${OCF_RESKEY_neutron_server_port=${OCF_RESKEY_neutron_server_port_default}}
 : ${OCF_RESKEY_amqp_server_port=${OCF_RESKEY_amqp_server_port_default}}
-
+: ${OCF_RESKEY_cluster_hostname=${OCF_RESKEY_cluster_hostname_default}}
+: ${OCF_RESKEY_delete_netns=${OCF_RESKEY_delete_netns_default}}
 #######################################################################
 
 usage() {
@@ -128,6 +134,22 @@ The listening port number of the AMQP server. Mandatory to perform a monitor che
 <shortdesc lang="en">AMQP listening port</shortdesc>                                                                                                                                                                      
 <content type="integer" default="${OCF_RESKEY_neutron_server_port_default}" />                                                                                                                                              
 </parameter>      
+
+<parameter name="cluster_hostname" unique="0" required="0">
+<longdesc lang="en">
+The (virtual) hostname of the whole cluster. Mandatory for using L3-agent in active/passive settings with a virtual IP address
+</longdesc>
+<shortdesc lang="en">(virtual) cluster hostname</shortdesc>
+<content type="string" default="${OCF_RESKEY_cluster_hostname_default}" />
+</parameter>
+
+<parameter name="delete_netns" unique="0" required="0">
+<longdesc lang="en">
+Delete IP namespaces (qrouter* + qdhcp*) after stopping the L3-agent
+</longdesc>
+<shortdesc lang="en">delete all ip namespaces"</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_delete_netns_default}" />
+</parameter>
 
 
 <parameter name="additional_parameters" unique="0" required="0">
@@ -233,6 +255,27 @@ neutron_l3_agent_monitor() {
 neutron_l3_agent_start() {
     local rc
 
+    # save local hostname to file
+    hostname > $LOCAL_hostname
+
+    # change hostname to cluster_hostname
+    hostname ${OCF_RESKEY_cluster_hostname}
+    rc=$?
+    if [ $rc -ne 0 ]; then
+       ocf_log err "Failed to set cluster hostname"
+       exit $OCF_ERR_GENERIC
+    fi
+    sleep 1
+
+    # restart neutron-plugin-openvswitch-agent for informing neutron-server about the new hostname
+    service neutron-plugin-openvswitch-agent restart
+    rc=$?
+    if [ $rc -ne 0]; then
+        ocf_log err "Failed to restart neutron-plugin-openvswitch-agent"
+        exit $OCF_ERR_GENERIC
+    fi
+
+
     neutron_l3_agent_status
     rc=$?
     if [ $rc -eq $OCF_SUCCESS ]; then
@@ -309,9 +352,40 @@ neutron_l3_agent_stop() {
         ocf_run kill -s KILL $pid
     fi
 
+    # switch back to local hostname
+    local_hostname=`cat $LOCAL_hostname`
+    hostname $local_hostname
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        ocf_log err "Failed to switch back to local hostname"
+        exit $OCF_ERR_GENERIC
+    fi
+
+    # delete all ip namespaces if config say so
+    ocf_log info "hauke $OCF_RESKEY_delete_netns"
+    if ocf_is_true $OCF_RESKEY_delete_netns; then
+        for ns in $(ip netns); do
+            ip netns del $ns
+            rc=$?
+            if [ $rc -ne 0 ]; then
+                ocf_log err "Failed to remove ip netns files"
+                exit $OCF_ERR_GENERIC
+            fi
+        done
+    fi
+
+    # restart neutron-plugin-openvswitch-agent for informing neutron-server about the new hostname
+    service neutron-plugin-openvswitch-agent restart
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        ocf_log err "Failed to restart neutron-plugin-openvswitch-agent"
+        exit $OCF_ERR_GENERIC
+    fi
+
     ocf_log info "OpenStack L3 Server (neutron-l3-agent) stopped"
 
     rm -f $OCF_RESKEY_pid
+    rm -f $LOCAL_hostname
 
     return $OCF_SUCCESS
 }
