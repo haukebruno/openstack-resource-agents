@@ -362,7 +362,6 @@ neutron_l3_agent_stop() {
     fi
 
     # delete all ip namespaces if config say so
-    ocf_log info "hauke $OCF_RESKEY_delete_netns"
     if ocf_is_true $OCF_RESKEY_delete_netns; then
         for ns in $(ip netns); do
             ip netns del $ns
